@@ -58,9 +58,13 @@ boost::shared_ptr< dynamic_reconfigure::Server<TebLocalPlannerReconfigureConfig>
 ros::Subscriber custom_obst_sub;
 ros::Subscriber via_points_sub;
 ros::Subscriber clicked_points_sub;
+ros::Subscriber init_pose_sub;
+ros::Subscriber goal_pose_sub;
+ros::Subscriber odom_sub;
+ros::Publisher velocity_pub;
 std::vector<ros::Subscriber> obst_vel_subs;
 unsigned int no_fixed_obstacles;
-
+  tf::TransformListener* p_tf_listener;
 // =========== Function declarations =============
 void CB_mainCycle(const ros::TimerEvent& e);
 void CB_publishCycle(const ros::TimerEvent& e);
@@ -68,22 +72,28 @@ void CB_reconfigure(TebLocalPlannerReconfigureConfig& reconfig, uint32_t level);
 void CB_customObstacle(const costmap_converter::ObstacleArrayMsg::ConstPtr& obst_msg);
 void CreateInteractiveMarker(const double& init_x, const double& init_y, unsigned int id, std::string frame, interactive_markers::InteractiveMarkerServer* marker_server, interactive_markers::InteractiveMarkerServer::FeedbackCallback feedback_cb);
 void CB_obstacle_marker(const visualization_msgs::InteractiveMarkerFeedbackConstPtr &feedback);
-void CB_clicked_points(const geometry_msgs::PointStampedConstPtr& point_msg);
 void CB_via_points(const nav_msgs::Path::ConstPtr& via_points_msg);
 void CB_setObstacleVelocity(const geometry_msgs::TwistConstPtr& twist_msg, const unsigned int id);
-
-
+void CB_goal_pose(const geometry_msgs::PoseStampedConstPtr& msg);
+void CB_odom(const nav_msgs::Odometry::ConstPtr& msg);
+// =========== user qihao =============
+PoseSE2 initial_pos(-4,0,0);
+PoseSE2 goal_pos(4,0,0);
+geometry_msgs::Twist g_cmd_vel;
+nav_msgs::Odometry robot_odom;
 // =============== Main function =================
 int main( int argc, char** argv )
 {
   ros::init(argc, argv, "test_optim_node");
   ros::NodeHandle n("~");
  
-  
+  tf::TransformListener tf_listener;
+  p_tf_listener = &tf_listener;
   // load ros parameters from node handle
   config.loadRosParamFromNodeHandle(n);
  
-  ros::Timer cycle_timer = n.createTimer(ros::Duration(0.025), CB_mainCycle);
+  //ros::Timer cycle_timer = n.createTimer(ros::Duration(0.025), CB_mainCycle);
+  ros::Timer cycle_timer = n.createTimer(ros::Duration(0.05), CB_mainCycle);
   ros::Timer publish_timer = n.createTimer(ros::Duration(0.1), CB_publishCycle);
   
   // setup dynamic reconfigure
@@ -94,21 +104,28 @@ int main( int argc, char** argv )
   // setup callback for custom obstacles
   custom_obst_sub = n.subscribe("obstacles", 1, CB_customObstacle);
   
-  // setup callback for clicked points (in rviz) that are considered as via-points
-  clicked_points_sub = n.subscribe("/clicked_point", 5, CB_clicked_points);
-  
   // setup callback for via-points (callback overwrites previously set via-points)
   via_points_sub = n.subscribe("via_points", 1, CB_via_points);
 
+  //init pose and goal pose
+  //init_pose_sub = n.subscribe("/initialpose", 1, CB_initial_pose);
+  goal_pose_sub = n.subscribe("/move_base_simple/goal", 1, CB_goal_pose);
+
+  odom_sub = n.subscribe("/odom", 1, CB_odom);
+
+  velocity_pub = n.advertise<geometry_msgs::Twist>("/cmd_vel", 1);
+
+  //
+  //const geometry_msgs::Polygon& msg
   // interactive marker server for simulated dynamic obstacles
   interactive_markers::InteractiveMarkerServer marker_server("marker_obstacles");
 
-  obst_vector.push_back( boost::make_shared<PointObstacle>(-3,1) );
-  obst_vector.push_back( boost::make_shared<PointObstacle>(6,2) );
-  obst_vector.push_back( boost::make_shared<PointObstacle>(0,0.1) );
-//  obst_vector.push_back( boost::make_shared<LineObstacle>(1,1.5,1,-1.5) ); //90 deg
-//  obst_vector.push_back( boost::make_shared<LineObstacle>(1,0,-1,0) ); //180 deg
-//  obst_vector.push_back( boost::make_shared<PointObstacle>(-1.5,-0.5) );
+  //obst_vector.push_back( boost::make_shared<PointObstacle>(-3,1) );
+  //obst_vector.push_back( boost::make_shared<PointObstacle>(6,2) );
+  //obst_vector.push_back( boost::make_shared<PointObstacle>(0,0.1) );
+  obst_vector.push_back( boost::make_shared<LineObstacle>(1,1.5,1,-1.5) ); //90 deg
+  obst_vector.push_back( boost::make_shared<LineObstacle>(1,0,-1,0) ); //180 deg
+  obst_vector.push_back( boost::make_shared<PointObstacle>(-1.5,-0.5) );
 
   // Dynamic obstacles
   Eigen::Vector2d vel (0.1, -0.3);
@@ -150,10 +167,10 @@ int main( int argc, char** argv )
   RobotFootprintModelPtr robot_model = TebLocalPlannerROS::getRobotFootprintFromParamServer(n);
   
   // Setup planner (homotopy class planning or just the local teb planner)
-  if (config.hcp.enable_homotopy_class_planning)
-    planner = PlannerInterfacePtr(new HomotopyClassPlanner(config, &obst_vector, robot_model, visual, &via_points));
-  else
-    planner = PlannerInterfacePtr(new TebOptimalPlanner(config, &obst_vector, robot_model, visual, &via_points));
+  //if (config.hcp.enable_homotopy_class_planning)
+ //   planner = PlannerInterfacePtr(new HomotopyClassPlanner(config, &obst_vector, robot_model, visual, &via_points));
+ // else
+  planner = PlannerInterfacePtr(new TebOptimalPlanner(config, &obst_vector, robot_model, visual, &via_points));
   
 
   no_fixed_obstacles = obst_vector.size();
@@ -165,13 +182,35 @@ int main( int argc, char** argv )
 // Planning loop
 void CB_mainCycle(const ros::TimerEvent& e)
 {
-  planner->plan(PoseSE2(-4,0,0), PoseSE2(4,0,0)); // hardcoded start and goal for testing purposes
+   /***/
+  try
+  {
+    tf::StampedTransform map_foot_frame;
+    //tf_listener.waitForTransform("map", "base_link", ros::Time(0), ros::Duration(10.0));
+    p_tf_listener->lookupTransform("map", "base_link", ros::Time(0), map_foot_frame);
+    initial_pos.x()  = map_foot_frame.getOrigin().getX();
+    initial_pos.y()  = map_foot_frame.getOrigin().getY();
+    initial_pos.theta()  = tf::getYaw(map_foot_frame.getRotation());
+  }
+  catch (tf::TransformException ex)
+  {
+    initial_pos.x()  = 0;
+    initial_pos.y()  = 0;
+    initial_pos.theta()  = 0;
+  }
+  planner->plan(initial_pos, goal_pos,&robot_odom.twist.twist,false); // hardcoded start and goal for testing purposes
+
+  //publish vel cmd
+  geometry_msgs::Twist cmd_vel;
+  double vy;
+  planner.get()->getVelocityCommand(cmd_vel.linear.x, vy, cmd_vel.angular.z,1);
+  velocity_pub.publish(cmd_vel);
 }
 
 // Visualization loop
 void CB_publishCycle(const ros::TimerEvent& e)
 {
-  planner->visualize();
+  planner->visualize();//publish poses(path+time) and path 
   visual->publishObstacles(obst_vector);
   visual->publishViaPoints(via_points);
 }
@@ -286,17 +325,6 @@ void CB_customObstacle(const costmap_converter::ObstacleArrayMsg::ConstPtr& obst
   }
 }
 
-
-void CB_clicked_points(const geometry_msgs::PointStampedConstPtr& point_msg)
-{
-  // we assume for simplicity that the fixed frame is already the map/planning frame
-  // consider clicked points as via-points
-  via_points.push_back( Eigen::Vector2d(point_msg->point.x, point_msg->point.y) );
-  ROS_INFO_STREAM("Via-point (" << point_msg->point.x << "," << point_msg->point.y << ") added.");
-  if (config.optim.weight_viapoint<=0)
-    ROS_WARN("Note, via-points are deactivated, since 'weight_via_point' <= 0");
-}
-
 void CB_via_points(const nav_msgs::Path::ConstPtr& via_points_msg)
 {
   ROS_INFO_ONCE("Via-points received. This message is printed once.");
@@ -305,6 +333,19 @@ void CB_via_points(const nav_msgs::Path::ConstPtr& via_points_msg)
   {
     via_points.emplace_back(pose.pose.position.x, pose.pose.position.y);
   }
+}
+
+void CB_goal_pose(const geometry_msgs::PoseStampedConstPtr& msg)
+{
+  goal_pos.x()  = msg.get()->pose.position.x;
+  goal_pos.y()  = msg.get()->pose.position.y;
+  goal_pos.theta()  = tf::getYaw(msg.get()->pose.orientation);
+}
+void CB_odom(const nav_msgs::Odometry::ConstPtr& msg)
+{
+  robot_odom.twist.twist.linear.x     = msg->twist.twist.linear.x;
+  robot_odom.twist.twist.linear.y     = msg->twist.twist.linear.y;
+  robot_odom.twist.twist.angular.z    = msg->twist.twist.angular.z;
 }
 
 void CB_setObstacleVelocity(const geometry_msgs::TwistConstPtr& twist_msg, const unsigned int id)
