@@ -1,8 +1,11 @@
 <launch>
 	
   	<!--- Run optimization test node -->
-   	<node pkg="teb_local_planner" type="test_optim_node" name="test_optim_node" output="screen" />
-
+   	<node pkg="teb_local_planner" type="test_optim_node" name="test_optim_node" output="screen" >
+        <param name="footprint_model/type"            value="polygon"/>
+		<param name="footprint_model/vertices"            value="[ [0.25, -0.05], [0.18, -0.05], [0.18, -0.18], [-0.19, -0.18]]"/>
+	    <param name="map_frame"                 	  value="/map"/>
+	</node>
   	<!-- RVIZ -->
   	<!-- <node pkg="rviz" type="rviz" name="rviz" args="-d $(find teb_local_planner)/cfg/rviz_test_optim.rviz" /> -->
 
